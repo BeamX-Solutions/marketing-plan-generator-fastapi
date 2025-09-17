@@ -17,10 +17,10 @@ app = FastAPI(title="MarketingPlan AI API", version="1.0.0")
 # Enhanced CORS middleware for better frontend compatibility
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for testing; restrict in production
+    allow_origins=["*"],  # Allow all origins for testing
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
 )
 
 # Pydantic models
