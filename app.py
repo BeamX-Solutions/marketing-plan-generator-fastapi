@@ -17,10 +17,7 @@ app = FastAPI(title="MarketingPlan AI API", version="1.0.0")
 # Enhanced CORS middleware for better frontend compatibility
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # Local development
-        "https://your-frontend-domain.com"  # Replace with your actual domain
-    ],
+    allow_origins=["*"],  # Allow all for testing; restrict in production
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
