@@ -1,187 +1,303 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Dict, Any, Union, Optional
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from typing import List, Union, Dict, Any, Optional
 import anthropic
-from datetime import datetime
 import os
 import json
+import uuid
+from datetime import datetime
 import logging
+from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="MarketingPlan AI API", version="1.0.0")
+# Initialize Anthropic client
+anthropic_client = None
 
-# Enhanced CORS middleware for better frontend compatibility
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for testing
-    allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global anthropic_client
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.error("ANTHROPIC_API_KEY environment variable not set")
+        raise ValueError("ANTHROPIC_API_KEY environment variable is required")
+    
+    anthropic_client = anthropic.Anthropic(api_key=api_key)
+    logger.info("Anthropic client initialized successfully")
+    yield
+    # Shutdown
+    logger.info("Application shutting down")
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Marketing Plan Generator API",
+    description="AI-powered marketing plan generation using Claude",
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-# Pydantic models
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",  # Vite dev server
+        "http://localhost:3000",  # Alternative dev port
+        "http://localhost:4173",  # Vite preview
+        "https://*.netlify.app",  # Netlify deployments
+        "https://*.vercel.app",   # Vercel deployments
+        "https://*.surge.sh",     # Surge deployments
+        "*"  # Allow all origins (be more restrictive in production)
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# Pydantic Models
 class QuestionnaireResponse(BaseModel):
-    question_id: str
+    questionId: str
     answer: Union[str, List[str]]
 
-class UserData(BaseModel):
-    id: str
+class GeneratePlanRequest(BaseModel):
     responses: List[QuestionnaireResponse]
-    current_square: int
-    current_question_index: int
-    completed_squares: List[int]
-    created_at: str
-    updated_at: str
 
-class MarketingPlanRequest(BaseModel):
-    user_id: str
-    responses: List[QuestionnaireResponse]
+class BusinessContext(BaseModel):
+    industry: str
+    businessModel: str
+    companySize: str
+    challenges: List[str]
 
 class MarketingSquare(BaseModel):
     title: str
     summary: str
-    key_points: List[str]
+    keyPoints: List[str]
     recommendations: List[str]
 
-class BusinessContext(BaseModel):
-    industry: str
-    business_model: str
-    company_size: str
-    challenges: List[str]
-    years_in_operation: Optional[str] = "Not specified"
-    geographic_scope: Optional[str] = "Not specified"
-    marketing_maturity: Optional[str] = "Not specified"
-    marketing_budget: Optional[str] = "Not specified"
-    time_availability: Optional[str] = "Not specified"
-    business_goals: Optional[List[str]] = []
-
 class MarketingPlan(BaseModel):
-    business_context: BusinessContext
+    businessContext: BusinessContext
     squares: Dict[int, MarketingSquare]
-    generated_at: str
+    generatedAt: str
+    planId: str
 
-class HealthCheck(BaseModel):
-    status: str
-    timestamp: str
-    api_configured: bool
-    environment: str
+class SavePlanRequest(BaseModel):
+    plan: MarketingPlan
+    planName: Optional[str] = None
 
-# Initialize Anthropic client
-def get_anthropic_client():
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        logger.warning("ANTHROPIC_API_KEY not found in environment")
-        return None
-    return anthropic.Anthropic(api_key=api_key)
+class PlanSummary(BaseModel):
+    planId: str
+    planName: str
+    createdAt: str
+    businessContext: BusinessContext
 
 # In-memory storage (replace with database in production)
-user_data_store = {}
-plans_store = {}
+plans_storage: Dict[str, MarketingPlan] = {}
 
-@app.get("/")
-async def root():
-    return {
-        "message": "MarketingPlan AI API is running", 
-        "version": "1.0.0",
-        "docs_url": "/docs",
-        "health_url": "/health"
+# Marketing Squares Configuration
+MARKETING_SQUARES = {
+    1: {
+        "title": "Target Market & Customer Avatar",
+        "description": "Define your ideal customers, their demographics, pain points, and buying behavior"
+    },
+    2: {
+        "title": "Value Proposition & Messaging", 
+        "description": "Craft compelling value propositions and key messages that resonate"
+    },
+    3: {
+        "title": "Media Channels & Reach",
+        "description": "Select the right marketing channels and develop content strategies"
+    },
+    4: {
+        "title": "Lead Capture & Acquisition",
+        "description": "Create effective lead magnets and conversion tactics"
+    },
+    5: {
+        "title": "Lead Nurturing & Relationship Building",
+        "description": "Develop systems to nurture leads and build lasting relationships"
+    },
+    6: {
+        "title": "Sales Conversion & Closing",
+        "description": "Optimize your sales process and closing techniques"
+    },
+    7: {
+        "title": "Customer Experience & Delivery",
+        "description": "Ensure exceptional service delivery and customer satisfaction"
+    },
+    8: {
+        "title": "Lifetime Value & Growth",
+        "description": "Maximize customer retention and increase lifetime value"
+    },
+    9: {
+        "title": "Referral System & Advocacy",
+        "description": "Build systems for referrals and turn customers into advocates"
     }
+}
 
-@app.post("/api/save-response")
-async def save_response(response: QuestionnaireResponse):
-    """Save individual questionnaire response"""
-    try:
-        # In production, save to database
-        logger.info(f"Saving response for question: {response.question_id}")
-        return {"message": "Response saved successfully", "question_id": response.question_id}
-    except Exception as e:
-        logger.error(f"Error saving response: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to save response")
+def get_anthropic_client():
+    """Dependency to get Anthropic client"""
+    if anthropic_client is None:
+        raise HTTPException(status_code=500, detail="Anthropic client not initialized")
+    return anthropic_client
 
-@app.post("/api/save-user-data")
-async def save_user_data(user_data: UserData):
-    """Save user progress"""
-    try:
-        user_data_store[user_data.id] = user_data.dict()
-        logger.info(f"Saved user data for user: {user_data.id}")
-        return {"message": "User data saved successfully", "user_id": user_data.id}
-    except Exception as e:
-        logger.error(f"Error saving user data: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to save user data")
-
-@app.get("/api/user-data/{user_id}")
-async def get_user_data(user_id: str):
-    """Get user progress"""
-    try:
-        if user_id not in user_data_store:
-            raise HTTPException(status_code=404, detail="User data not found")
-        return {"user_data": user_data_store[user_id]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error retrieving user data: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve user data")
-
-@app.post("/api/generate-plan")
-async def generate_marketing_plan(request: MarketingPlanRequest):
-    """Generate AI-powered marketing plan using Claude"""
-    try:
-        logger.info(f"Generating marketing plan for user: {request.user_id}")
-        
-        # Extract business context from responses
-        business_context = extract_business_context(request.responses)
-        logger.info(f"Extracted business context: {business_context}")
-        
-        # Generate plan using Claude AI
-        ai_plan = await generate_claude_plan(request.responses, business_context)
-        
-        # Save plan to storage
-        plans_store[request.user_id] = ai_plan.dict()
-        logger.info(f"Generated and saved marketing plan for user: {request.user_id}")
-        
-        return ai_plan
+def extract_business_context(responses: List[QuestionnaireResponse]) -> BusinessContext:
+    """Extract business context from questionnaire responses"""
+    response_dict = {r.questionId: r.answer for r in responses}
     
-    except Exception as e:
-        logger.error(f"Failed to generate plan: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate plan: {str(e)}")
+    return BusinessContext(
+        industry=response_dict.get('business-industry', 'Unknown'),
+        businessModel=response_dict.get('business-model', 'Unknown'),
+        companySize=response_dict.get('company-size', 'Unknown'),
+        challenges=response_dict.get('primary-challenges', []) if isinstance(response_dict.get('primary-challenges'), list) else []
+    )
 
-@app.get("/api/plan/{user_id}")
-async def get_marketing_plan(user_id: str):
-    """Retrieve saved marketing plan"""
-    try:
-        if user_id not in plans_store:
-            raise HTTPException(status_code=404, detail="Marketing plan not found")
-        return {"plan": plans_store[user_id]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error retrieving marketing plan: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve marketing plan")
+def create_claude_prompt(responses: List[QuestionnaireResponse], square_id: int) -> str:
+    """Create a detailed prompt for Claude to generate marketing square content"""
+    
+    response_dict = {r.questionId: r.answer for r in responses}
+    square_info = MARKETING_SQUARES[square_id]
+    
+    # Build context from responses
+    business_context = f"""
+Business Industry: {response_dict.get('business-industry', 'Not specified')}
+Business Model: {response_dict.get('business-model', 'Not specified')}
+Company Size: {response_dict.get('company-size', 'Not specified')}
+Geographic Scope: {response_dict.get('geographic-scope', 'Not specified')}
+Years in Operation: {response_dict.get('years-operation', 'Not specified')}
+Marketing Budget: {response_dict.get('marketing-budget', 'Not specified')}
+Primary Challenges: {response_dict.get('primary-challenges', 'Not specified')}
+"""
 
-async def generate_claude_plan(responses: List[QuestionnaireResponse], business_context: Dict) -> MarketingPlan:
-    """Use Claude to generate intelligent marketing plan"""
+    # Square-specific context
+    square_context = ""
+    if square_id == 1:  # Target Market
+        square_context = f"""
+Target Age: {response_dict.get('target-age', 'Not specified')}
+Target Income: {response_dict.get('target-income', 'Not specified')}
+Target Location: {response_dict.get('target-location', 'Not specified')}
+Customer Pain Points: {response_dict.get('customer-pain-points', 'Not specified')}
+Customer Goals: {response_dict.get('customer-goals', 'Not specified')}
+Buying Behavior: {response_dict.get('buying-behavior', 'Not specified')}
+"""
+    elif square_id == 2:  # Value Proposition
+        square_context = f"""
+Unique Selling Points: {response_dict.get('unique-selling-points', 'Not specified')}
+Key Benefits: {response_dict.get('key-benefits', 'Not specified')}
+Brand Personality: {response_dict.get('brand-personality', 'Not specified')}
+Elevator Pitch: {response_dict.get('elevator-pitch', 'Not specified')}
+Messaging Tone: {response_dict.get('messaging-tone', 'Not specified')}
+"""
+    elif square_id == 3:  # Media Channels
+        square_context = f"""
+Preferred Channels: {response_dict.get('preferred-channels', 'Not specified')}
+Content Types: {response_dict.get('content-types', 'Not specified')}
+Content Frequency: {response_dict.get('content-frequency', 'Not specified')}
+Social Platforms: {response_dict.get('social-platforms', 'Not specified')}
+Reach Goals: {response_dict.get('reach-goals', 'Not specified')}
+"""
+    elif square_id == 4:  # Lead Capture
+        square_context = f"""
+Lead Magnets: {response_dict.get('lead-magnets', 'Not specified')}
+Landing Pages: {response_dict.get('landing-pages', 'Not specified')}
+Conversion Tactics: {response_dict.get('conversion-tactics', 'Not specified')}
+Lead Goals: {response_dict.get('lead-goals', 'Not specified')}
+"""
+    elif square_id == 5:  # Lead Nurturing
+        square_context = f"""
+Email Sequences: {response_dict.get('email-sequences', 'Not specified')}
+Nurturing Content: {response_dict.get('nurturing-content', 'Not specified')}
+Relationship Building: {response_dict.get('relationship-building', 'Not specified')}
+Nurturing Timeline: {response_dict.get('nurturing-timeline', 'Not specified')}
+"""
+    elif square_id == 6:  # Sales Conversion
+        square_context = f"""
+Sales Process: {response_dict.get('sales-process', 'Not specified')}
+Common Objections: {response_dict.get('common-objections', 'Not specified')}
+Closing Techniques: {response_dict.get('closing-techniques', 'Not specified')}
+Conversion Rate: {response_dict.get('conversion-rate', 'Not specified')}
+"""
+    elif square_id == 7:  # Customer Experience
+        square_context = f"""
+Service Delivery: {response_dict.get('service-delivery', 'Not specified')}
+Onboarding Process: {response_dict.get('onboarding-process', 'Not specified')}
+Customer Support: {response_dict.get('customer-support', 'Not specified')}
+Satisfaction Measurement: {response_dict.get('satisfaction-measurement', 'Not specified')}
+"""
+    elif square_id == 8:  # Lifetime Value
+        square_context = f"""
+Repeat Business: {response_dict.get('repeat-business', 'Not specified')}
+Upsell Opportunities: {response_dict.get('upsell-opportunities', 'Not specified')}
+Retention Strategies: {response_dict.get('retention-strategies', 'Not specified')}
+Lifetime Value: {response_dict.get('lifetime-value', 'Not specified')}
+"""
+    elif square_id == 9:  # Referral System
+        square_context = f"""
+Referral Percentage: {response_dict.get('referral-percentage', 'Not specified')}
+Referral Process: {response_dict.get('referral-process', 'Not specified')}
+Referral Incentives: {response_dict.get('referral-incentives', 'Not specified')}
+Advocacy Opportunities: {response_dict.get('advocacy-opportunities', 'Not specified')}
+Word of Mouth: {response_dict.get('word-of-mouth', 'Not specified')}
+"""
+
+    prompt = f"""
+You are a senior marketing strategist creating a comprehensive marketing plan. Based on the business information and questionnaire responses provided, generate detailed content for the "{square_info['title']}" section of a 9-square marketing framework.
+
+BUSINESS CONTEXT:
+{business_context}
+
+SQUARE FOCUS: {square_info['title']}
+DESCRIPTION: {square_info['description']}
+
+RELEVANT RESPONSES:
+{square_context}
+
+Please provide a JSON response with the following structure:
+{{
+    "title": "{square_info['title']}",
+    "summary": "A concise 1-2 sentence summary of this marketing square for this specific business",
+    "keyPoints": [
+        "4-6 specific, actionable key points based on the questionnaire responses",
+        "Each point should be tailored to this business's specific situation",
+        "Include specific data/responses where relevant",
+        "Focus on insights derived from the provided information"
+    ],
+    "recommendations": [
+        "4-6 specific, actionable recommendations for this business",
+        "Each recommendation should be practical and implementable",
+        "Prioritize recommendations based on the business context",
+        "Include specific tactics, tools, or strategies where appropriate"
+    ]
+}}
+
+Make sure all content is:
+1. Specific to this business based on their responses
+2. Actionable and practical
+3. Professional but accessible
+4. Focused on the specific marketing square's objectives
+5. Consistent with their industry, size, and business model
+
+Return only valid JSON without any additional text or formatting.
+"""
     
-    client = get_anthropic_client()
-    if not client:
-        logger.warning("Claude client not available, using fallback")
-        return generate_fallback_plan(responses, business_context)
-    
-    # Prepare the prompt with user responses
-    prompt = create_marketing_plan_prompt(responses, business_context)
+    return prompt
+
+async def generate_square_content(
+    responses: List[QuestionnaireResponse], 
+    square_id: int,
+    client: anthropic.Anthropic
+) -> MarketingSquare:
+    """Generate content for a specific marketing square using Claude"""
     
     try:
-        logger.info("Calling Claude API for plan generation")
+        prompt = create_claude_prompt(responses, square_id)
         
-        # Using Claude-3-Sonnet
         message = client.messages.create(
-            model="claude-3-sonnet-20240229",
-            max_tokens=4000,
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=1000,
             temperature=0.7,
-            system="You are a marketing strategy expert. Generate comprehensive, actionable marketing plans based on the 9-square marketing framework. Always respond with valid JSON that matches the required structure exactly.",
             messages=[
                 {
                     "role": "user",
@@ -190,591 +306,160 @@ async def generate_claude_plan(responses: List[QuestionnaireResponse], business_
             ]
         )
         
-        ai_content = message.content[0].text
-        logger.info("Received response from Claude API")
+        # Parse Claude's response
+        response_text = message.content[0].text
+        logger.info(f"Claude response for square {square_id}: {response_text[:200]}...")
         
-        structured_plan = parse_ai_response_to_plan(ai_content, business_context)
-        return structured_plan
-    
-    except Exception as e:
-        logger.error(f"Claude API error: {str(e)}")
-        # Fallback to template-based generation if AI fails
-        return generate_fallback_plan(responses, business_context)
-
-def create_marketing_plan_prompt(responses: List[QuestionnaireResponse], business_context: Dict) -> str:
-    """Create a detailed prompt for Claude plan generation"""
-    
-    # Organize responses by square for better context
-    responses_by_square = {}
-    business_context_responses = []
-    
-    for resp in responses:
-        # Check if it's a business context question (square 0) or specific square question
-        if resp.question_id in ["industry", "business-model", "company-size", "years-in-operation", 
-                               "geographic-scope", "primary-challenges", "marketing-maturity", 
-                               "marketing-budget", "time-availability", "business-goals"]:
-            business_context_responses.append(f"• {resp.question_id}: {resp.answer}")
-        else:
-            # Try to determine square from question content or ID patterns
-            square_num = determine_square_from_question(resp.question_id)
-            if square_num not in responses_by_square:
-                responses_by_square[square_num] = []
-            responses_by_square[square_num].append(f"• {resp.question_id}: {resp.answer}")
-    
-    business_context_text = "\n".join(business_context_responses)
-    
-    square_responses_text = ""
-    for square_num in sorted(responses_by_square.keys()):
-        square_responses_text += f"\nSquare {square_num} Responses:\n" + "\n".join(responses_by_square[square_num])
-    
-    prompt = f"""
-    Based on the comprehensive business information and questionnaire responses below, create a highly personalized marketing plan using the 9-square marketing framework:
-
-    BUSINESS CONTEXT:
-    - Industry: {business_context.get('industry', 'Not specified')}
-    - Business Model: {business_context.get('business_model', 'Not specified')}
-    - Company Size: {business_context.get('company_size', 'Not specified')}
-    - Years in Operation: {business_context.get('years_in_operation', 'Not specified')}
-    - Geographic Scope: {business_context.get('geographic_scope', 'Not specified')}
-    - Marketing Maturity: {business_context.get('marketing_maturity', 'Not specified')}
-    - Marketing Budget: {business_context.get('marketing_budget', 'Not specified')}
-    - Time Availability: {business_context.get('time_availability', 'Not specified')}
-    - Key Challenges: {', '.join(business_context.get('challenges', ['Not specified']))}
-    - Business Goals: {', '.join(business_context.get('business_goals', ['Not specified']))}
-
-    BUSINESS CONTEXT RESPONSES:
-    {business_context_text}
-    
-    DETAILED QUESTIONNAIRE RESPONSES:
-    {square_responses_text}
-    
-    Generate a comprehensive marketing plan with these 9 squares, making each highly specific to their business context and responses:
-
-    1. Target Market & Customer Avatar - Use their demographic, pain point, and customer behavior responses
-    2. Value Proposition & Messaging - Incorporate their unique advantages and proof points
-    3. Media Channels & Reach - Consider their current channels, preferences, and content capacity
-    4. Lead Capture & Acquisition - Build on their current lead generation and website optimization
-    5. Lead Nurturing & Relationship Building - Factor in their follow-up process and timeline
-    6. Sales Conversion & Closing - Address their sales process and common objections
-    7. Customer Experience & Delivery - Enhance their delivery and support methods
-    8. Lifetime Value & Growth - Leverage their retention and upsell opportunities
-    9. Referral System & Advocacy - Build on their current referral patterns and incentives
-    
-    For each square, provide:
-    - A clear, specific title
-    - A practical summary (2-3 sentences) tailored to their exact business situation
-    - 4-5 key insights based on their specific responses, industry, and context
-    - 4-5 highly actionable recommendations they can implement given their budget, time, and maturity level
-    
-    Make every recommendation specific to:
-    - Their industry and business model
-    - Their budget constraints ({business_context.get('marketing_budget', 'Not specified')})
-    - Their time availability ({business_context.get('time_availability', 'Not specified')})
-    - Their marketing maturity level ({business_context.get('marketing_maturity', 'Not specified')})
-    - Their specific challenges and goals
-    
-    CRITICAL: Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
-    {{
-        "squares": {{
-            "1": {{
-                "title": "Target Market & Customer Avatar",
-                "summary": "Brief summary here tailored to their responses",
-                "key_points": ["Point 1 based on their data", "Point 2", "Point 3", "Point 4"],
-                "recommendations": ["Specific rec 1", "Specific rec 2", "Specific rec 3", "Specific rec 4"]
-            }},
-            "2": {{
-                "title": "Value Proposition & Messaging",
-                "summary": "Brief summary here tailored to their responses",
-                "key_points": ["Point 1 based on their data", "Point 2", "Point 3", "Point 4"],
-                "recommendations": ["Specific rec 1", "Specific rec 2", "Specific rec 3", "Specific rec 4"]
-            }},
-            "3": {{
-                "title": "Media Channels & Reach",
-                "summary": "Brief summary here tailored to their responses",
-                "key_points": ["Point 1 based on their data", "Point 2", "Point 3", "Point 4"],
-                "recommendations": ["Specific rec 1", "Specific rec 2", "Specific rec 3", "Specific rec 4"]
-            }},
-            "4": {{
-                "title": "Lead Capture & Acquisition",
-                "summary": "Brief summary here tailored to their responses",
-                "key_points": ["Point 1 based on their data", "Point 2", "Point 3", "Point 4"],
-                "recommendations": ["Specific rec 1", "Specific rec 2", "Specific rec 3", "Specific rec 4"]
-            }},
-            "5": {{
-                "title": "Lead Nurturing & Relationship Building",
-                "summary": "Brief summary here tailored to their responses",
-                "key_points": ["Point 1 based on their data", "Point 2", "Point 3", "Point 4"],
-                "recommendations": ["Specific rec 1", "Specific rec 2", "Specific rec 3", "Specific rec 4"]
-            }},
-            "6": {{
-                "title": "Sales Conversion & Closing",
-                "summary": "Brief summary here tailored to their responses",
-                "key_points": ["Point 1 based on their data", "Point 2", "Point 3", "Point 4"],
-                "recommendations": ["Specific rec 1", "Specific rec 2", "Specific rec 3", "Specific rec 4"]
-            }},
-            "7": {{
-                "title": "Customer Experience & Delivery",
-                "summary": "Brief summary here tailored to their responses",
-                "key_points": ["Point 1 based on their data", "Point 2", "Point 3", "Point 4"],
-                "recommendations": ["Specific rec 1", "Specific rec 2", "Specific rec 3", "Specific rec 4"]
-            }},
-            "8": {{
-                "title": "Lifetime Value & Growth",
-                "summary": "Brief summary here tailored to their responses",
-                "key_points": ["Point 1 based on their data", "Point 2", "Point 3", "Point 4"],
-                "recommendations": ["Specific rec 1", "Specific rec 2", "Specific rec 3", "Specific rec 4"]
-            }},
-            "9": {{
-                "title": "Referral System & Advocacy",
-                "summary": "Brief summary here tailored to their responses",
-                "key_points": ["Point 1 based on their data", "Point 2", "Point 3", "Point 4"],
-                "recommendations": ["Specific rec 1", "Specific rec 2", "Specific rec 3", "Specific rec 4"]
-            }}
-        }}
-    }}
-    """
-    
-    return prompt
-
-def determine_square_from_question(question_id: str) -> int:
-    """Determine which marketing square a question belongs to based on question ID patterns"""
-    question_id_lower = question_id.lower()
-    
-    # Square 1: Target Market & Customer Avatar
-    if any(keyword in question_id_lower for keyword in ['target', 'demographics', 'customer', 'pain-points', 'goals', 'buying-behavior', 'sources']):
-        return 1
-    
-    # Square 2: Value Proposition & Messaging  
-    elif any(keyword in question_id_lower for keyword in ['problem-solved', 'unique-advantages', 'benefits', 'emotional', 'proof-points']):
-        return 2
-    
-    # Square 3: Media Channels & Reach
-    elif any(keyword in question_id_lower for keyword in ['marketing-channels', 'digital-marketing', 'content-creation']):
-        return 3
-    
-    # Square 4: Lead Capture & Acquisition
-    elif any(keyword in question_id_lower for keyword in ['lead-generation', 'lead-magnets', 'website-optimization']):
-        return 4
-    
-    # Square 5: Lead Nurturing & Relationship Building
-    elif any(keyword in question_id_lower for keyword in ['follow-up', 'email-marketing', 'educational-content', 'relationship-timeline']):
-        return 5
-    
-    # Square 6: Sales Conversion & Closing
-    elif any(keyword in question_id_lower for keyword in ['sales-process', 'objections', 'pricing-strategy', 'conversion-rate']):
-        return 6
-    
-    # Square 7: Customer Experience & Delivery
-    elif any(keyword in question_id_lower for keyword in ['delivery-method', 'onboarding', 'customer-support', 'feedback']):
-        return 7
-    
-    # Square 8: Lifetime Value & Growth
-    elif any(keyword in question_id_lower for keyword in ['repeat-business', 'upsell', 'retention', 'customer-value']):
-        return 8
-    
-    # Square 9: Referral System & Advocacy
-    elif any(keyword in question_id_lower for keyword in ['referrals', 'referral-process', 'incentives', 'advocacy']):
-        return 9
-    
-    # Default to general if can't determine
-    else:
-        return 0
-
-def extract_business_context(responses: List[QuestionnaireResponse]) -> Dict:
-    """Extract comprehensive business context from all responses"""
-    context = {
-        "industry": "Not specified",
-        "business_model": "Not specified", 
-        "company_size": "Not specified",
-        "challenges": [],
-        "years_in_operation": "Not specified",
-        "geographic_scope": "Not specified",
-        "marketing_maturity": "Not specified",
-        "marketing_budget": "Not specified",
-        "time_availability": "Not specified",
-        "business_goals": []
-    }
-    
-    # Map all the business context questions from your frontend
-    for response in responses:
-        question_id = response.question_id.lower()
-        answer = response.answer
+        # Parse JSON response
+        square_data = json.loads(response_text)
         
-        # Business Context Questions (Square 0)
-        if question_id == "industry":
-            context["industry"] = answer
-        elif question_id == "business-model":
-            context["business_model"] = answer
-        elif question_id == "company-size":
-            context["company_size"] = answer
-        elif question_id == "years-in-operation":
-            context["years_in_operation"] = answer
-        elif question_id == "geographic-scope":
-            context["geographic_scope"] = answer
-        elif question_id == "primary-challenges":
-            context["challenges"] = answer if isinstance(answer, list) else [answer]
-        elif question_id == "marketing-maturity":
-            context["marketing_maturity"] = answer
-        elif question_id == "marketing-budget":
-            context["marketing_budget"] = answer
-        elif question_id == "time-availability":
-            context["time_availability"] = answer
-        elif question_id == "business-goals":
-            context["business_goals"] = answer if isinstance(answer, list) else [answer]
-        
-        # Legacy support for older question IDs
-        elif "industry" in question_id:
-            context["industry"] = answer
-        elif "model" in question_id:
-            context["business_model"] = answer
-        elif "size" in question_id:
-            context["company_size"] = answer
-        elif "challenge" in question_id:
-            challenges = answer if isinstance(answer, list) else [answer]
-            context["challenges"].extend(challenges)
-    
-    return context
-
-def parse_ai_response_to_plan(ai_content: str, business_context: Dict) -> MarketingPlan:
-    """Parse Claude response into structured MarketingPlan"""
-    try:
-        # Clean the response - remove any markdown formatting
-        cleaned_content = ai_content.strip()
-        if cleaned_content.startswith('```json'):
-            cleaned_content = cleaned_content[7:]
-        if cleaned_content.startswith('```'):
-            cleaned_content = cleaned_content[3:]
-        if cleaned_content.endswith('```'):
-            cleaned_content = cleaned_content[:-3]
-        cleaned_content = cleaned_content.strip()
-        
-        logger.info(f"Parsing Claude response (length: {len(cleaned_content)})")
-        
-        # Parse JSON
-        parsed_content = json.loads(cleaned_content)
-        
-        squares = {}
-        for square_id, square_data in parsed_content.get("squares", {}).items():
-            squares[int(square_id)] = MarketingSquare(
-                title=square_data.get("title", f"Square {square_id}"),
-                summary=square_data.get("summary", "Summary not available"),
-                key_points=square_data.get("key_points", []),
-                recommendations=square_data.get("recommendations", [])
-            )
-        
-        logger.info(f"Successfully parsed {len(squares)} marketing squares")
-        
-        return MarketingPlan(
-            business_context=BusinessContext(
-                industry=business_context.get("industry", "Not specified"),
-                business_model=business_context.get("business_model", "Not specified"),
-                company_size=business_context.get("company_size", "Not specified"),
-                challenges=business_context.get("challenges", []),
-                years_in_operation=business_context.get("years_in_operation", "Not specified"),
-                geographic_scope=business_context.get("geographic_scope", "Not specified"),
-                marketing_maturity=business_context.get("marketing_maturity", "Not specified"),
-                marketing_budget=business_context.get("marketing_budget", "Not specified"),
-                time_availability=business_context.get("time_availability", "Not specified"),
-                business_goals=business_context.get("business_goals", [])
-            ),
-            squares=squares,
-            generated_at=datetime.now().isoformat()
+        return MarketingSquare(
+            title=square_data["title"],
+            summary=square_data["summary"],
+            keyPoints=square_data["keyPoints"],
+            recommendations=square_data["recommendations"]
         )
-    
+        
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {e}")
-        logger.error(f"Claude response: {ai_content[:500]}...")
-        # Fallback to template-based generation
-        return generate_fallback_plan([], business_context)
+        logger.error(f"Failed to parse Claude response for square {square_id}: {e}")
+        # Fallback content
+        return MarketingSquare(
+            title=MARKETING_SQUARES[square_id]["title"],
+            summary=f"AI-generated content for {MARKETING_SQUARES[square_id]['title']} based on your business profile.",
+            keyPoints=[
+                "Analysis of your specific business context",
+                "Tailored insights based on your responses",
+                "Strategic recommendations for this area",
+                "Implementation considerations"
+            ],
+            recommendations=[
+                "Develop a structured approach to this marketing area",
+                "Implement tracking and measurement systems",
+                "Regular review and optimization",
+                "Align with overall business objectives"
+            ]
+        )
     except Exception as e:
-        logger.error(f"Error parsing Claude response: {e}")
-        return generate_fallback_plan([], business_context)
+        logger.error(f"Error generating content for square {square_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate content for square {square_id}")
 
-def generate_fallback_plan(responses: List[QuestionnaireResponse], business_context: Dict) -> MarketingPlan:
-    """Generate a basic template plan if Claude fails"""
-    logger.info("Generating fallback marketing plan")
-    
-    squares = {}
-    
-    square_templates = {
-        1: {
-            "title": "Target Market & Customer Avatar",
-            "summary": f"Define your ideal customers in the {business_context.get('industry', 'your')} industry with a focus on {business_context.get('business_model', 'your business model')}.",
-            "key_points": [
-                f"Operating in {business_context.get('industry', 'your industry')} sector",
-                f"Business model: {business_context.get('business_model', 'needs definition')}",
-                f"Company size: {business_context.get('company_size', 'needs assessment')}",
-                "Customer segmentation is critical for targeted marketing"
-            ],
-            "recommendations": [
-                "Create detailed buyer personas with demographics and psychographics",
-                "Conduct customer interviews to validate assumptions",
-                "Analyze competitor customer bases for market insights",
-                "Use Google Analytics and social media insights for data"
-            ]
-        },
-        2: {
-            "title": "Value Proposition & Messaging",
-            "summary": "Develop compelling messages that clearly communicate your unique value and resonate with your target market's needs.",
-            "key_points": [
-                "Need clear differentiation from competitors",
-                "Message must address specific customer pain points",
-                "Brand personality should align with target audience",
-                "Consistent messaging across all touchpoints is essential"
-            ],
-            "recommendations": [
-                "Test different value propositions with target customers",
-                "Create a comprehensive brand style and voice guide",
-                "Develop elevator pitches for different scenarios",
-                "A/B test messaging across marketing channels"
-            ]
-        },
-        3: {
-            "title": "Media Channels & Reach",
-            "summary": "Select and optimize the right marketing channels where your target audience is most active and engaged.",
-            "key_points": [
-                "Multi-channel approach increases reach and frequency",
-                "Content strategy must align with channel characteristics",
-                "Consistent publishing schedule builds audience trust",
-                "Channel selection based on audience behavior data"
-            ],
-            "recommendations": [
-                "Start with 2-3 channels and master them first",
-                "Create a content calendar with channel-specific content",
-                "Repurpose content across channels with platform optimization",
-                "Track performance metrics for each channel monthly"
-            ]
-        },
-        4: {
-            "title": "Lead Capture & Acquisition",
-            "summary": "Implement systems to attract and capture qualified leads through strategic touchpoints and compelling offers.",
-            "key_points": [
-                "Lead magnets must provide genuine value to prospects",
-                "Multiple capture points increase conversion opportunities",
-                "Landing page optimization is crucial for conversions",
-                "Lead quality is more important than quantity"
-            ],
-            "recommendations": [
-                "Create industry-specific lead magnets (ebooks, tools, templates)",
-                "Optimize landing pages with clear value propositions",
-                "Implement progressive profiling to gather lead information",
-                "Set up lead scoring to prioritize follow-up efforts"
-            ]
-        },
-        5: {
-            "title": "Lead Nurturing & Relationship Building",
-            "summary": "Develop systematic approaches to educate and engage leads through their buyer journey until they're sales-ready.",
-            "key_points": [
-                "Automated email sequences provide consistent touchpoints",
-                "Educational content builds trust and authority",
-                "Personalization increases engagement rates significantly",
-                "Multi-touch nurturing campaigns improve conversion rates"
-            ],
-            "recommendations": [
-                "Create email drip campaigns based on lead behavior",
-                "Segment leads by interest, industry, or buying stage",
-                "Provide valuable educational content consistently",
-                "Use marketing automation to scale personalization"
-            ]
-        },
-        6: {
-            "title": "Sales Conversion & Closing",
-            "summary": "Optimize your sales process to effectively convert qualified leads into paying customers with clear systems and follow-up.",
-            "key_points": [
-                "Clear sales process reduces friction and confusion",
-                "Follow-up systems prevent leads from falling through cracks",
-                "Objection handling preparation improves close rates",
-                "Sales and marketing alignment is crucial for success"
-            ],
-            "recommendations": [
-                "Document and standardize your sales process steps",
-                "Create objection handling scripts and resources",
-                "Implement CRM system for lead tracking and follow-up",
-                "Establish clear handoff process between marketing and sales"
-            ]
-        },
-        7: {
-            "title": "Customer Experience & Delivery",
-            "summary": "Ensure exceptional customer experience and service delivery that exceeds expectations and builds loyalty.",
-            "key_points": [
-                "First impressions set the tone for entire relationship",
-                "Consistent delivery builds trust and reduces churn",
-                "Customer feedback loops improve service quality",
-                "Proactive communication prevents issues and builds confidence"
-            ],
-            "recommendations": [
-                "Create customer onboarding process with clear expectations",
-                "Implement regular check-ins and progress updates",
-                "Establish customer feedback collection and response system",
-                "Document service delivery standards for consistency"
-            ]
-        },
-        8: {
-            "title": "Lifetime Value & Growth",
-            "summary": "Maximize customer lifetime value through retention strategies, upselling, and expanding relationships over time.",
-            "key_points": [
-                "Retention costs significantly less than acquisition",
-                "Upselling to existing customers has higher success rates",
-                "Customer success directly impacts lifetime value",
-                "Regular value delivery maintains customer relationships"
-            ],
-            "recommendations": [
-                "Create customer success programs focused on outcomes",
-                "Develop upsell and cross-sell opportunity mapping",
-                "Implement customer health scoring and intervention triggers",
-                "Establish regular business reviews with key accounts"
-            ]
-        },
-        9: {
-            "title": "Referral System & Advocacy",
-            "summary": "Build systematic approaches to generate referrals and turn satisfied customers into active brand advocates.",
-            "key_points": [
-                "Satisfied customers are often willing to refer but need prompting",
-                "Referral systems require clear processes and incentives",
-                "Customer testimonials and case studies build social proof",
-                "Word-of-mouth marketing has highest trust and conversion rates"
-            ],
-            "recommendations": [
-                "Create formal referral program with clear incentives",
-                "Systematically collect customer testimonials and reviews",
-                "Develop case studies showcasing customer success stories",
-                "Make it easy for customers to share and recommend your business"
-            ]
-        }
-    }
-    
-    # Use templates for all squares
-    for i in range(1, 10):
-        if i in square_templates:
-            squares[i] = MarketingSquare(**square_templates[i])
-    
-    return MarketingPlan(
-        business_context=BusinessContext(
-            industry=business_context.get("industry", "Not specified"),
-            business_model=business_context.get("business_model", "Not specified"),
-            company_size=business_context.get("company_size", "Not specified"),
-            challenges=business_context.get("challenges", []),
-            years_in_operation=business_context.get("years_in_operation", "Not specified"),
-            geographic_scope=business_context.get("geographic_scope", "Not specified"),
-            marketing_maturity=business_context.get("marketing_maturity", "Not specified"),
-            marketing_budget=business_context.get("marketing_budget", "Not specified"),
-            time_availability=business_context.get("time_availability", "Not specified"),
-            business_goals=business_context.get("business_goals", [])
-        ),
-        squares=squares,
-        generated_at=datetime.now().isoformat()
-    )
+# API Endpoints
 
-@app.get("/api/questions")
-async def get_questions_structure():
-    """Get the complete questions structure for frontend reference"""
-    return {
-        "marketing_squares": [
-            {"id": 1, "title": "Target Market & Customer Avatar", "description": "Define your ideal customer profile"},
-            {"id": 2, "title": "Value Proposition & Messaging", "description": "Craft your unique value proposition"},
-            {"id": 3, "title": "Media Channels & Reach", "description": "Select optimal marketing channels"},
-            {"id": 4, "title": "Lead Capture & Acquisition", "description": "Design lead generation systems"},
-            {"id": 5, "title": "Lead Nurturing & Relationship Building", "description": "Build relationships with prospects"},
-            {"id": 6, "title": "Sales Conversion & Closing", "description": "Optimize your sales process"},
-            {"id": 7, "title": "Customer Experience & Delivery", "description": "Deliver exceptional customer experience"},
-            {"id": 8, "title": "Lifetime Value & Growth", "description": "Maximize customer lifetime value"},
-            {"id": 9, "title": "Referral System & Advocacy", "description": "Create systematic referral generation"}
-        ],
-        "expected_question_ids": {
-            "business_context": [
-                "industry", "business-model", "company-size", "years-in-operation",
-                "geographic-scope", "primary-challenges", "marketing-maturity", 
-                "marketing-budget", "time-availability", "business-goals"
-            ],
-            "square_1": [
-                "target-demographics-age", "target-demographics-income", "target-location",
-                "customer-pain-points", "customer-goals", "customer-buying-behavior", 
-                "current-customer-sources"
-            ],
-            "square_2": [
-                "core-problem-solved", "unique-advantages", "tangible-benefits", 
-                "emotional-benefits", "proof-points"
-            ],
-            "square_3": [
-                "current-marketing-channels", "digital-marketing-preferences", 
-                "content-creation-capacity"
-            ],
-            "square_4": [
-                "current-lead-generation", "lead-magnets", "website-optimization"
-            ],
-            "square_5": [
-                "follow-up-process", "email-marketing-current", "educational-content", 
-                "relationship-timeline"
-            ],
-            "square_6": [
-                "sales-process", "common-objections", "pricing-strategy", "conversion-rate"
-            ],
-            "square_7": [
-                "delivery-method", "onboarding-process", "customer-support", "customer-feedback"
-            ],
-            "square_8": [
-                "repeat-business", "upsell-opportunities", "customer-retention", "average-customer-value"
-            ],
-            "square_9": [
-                "current-referrals", "referral-process", "referral-incentives", "customer-advocacy"
-            ]
-        }
-    }
-
-@app.post("/api/validate-responses")
-async def validate_responses(responses: List[QuestionnaireResponse]):
-    """Validate that responses contain expected question IDs"""
-    expected_questions = await get_questions_structure()
-    all_expected_ids = []
-    
-    for square_questions in expected_questions["expected_question_ids"].values():
-        all_expected_ids.extend(square_questions)
-    
-    provided_ids = [resp.question_id for resp in responses]
-    
-    missing_ids = [qid for qid in all_expected_ids if qid not in provided_ids]
-    unexpected_ids = [qid for qid in provided_ids if qid not in all_expected_ids]
-    
-    return {
-        "is_valid": len(missing_ids) == 0,
-        "total_responses": len(responses),
-        "expected_questions": len(all_expected_ids),
-        "missing_question_ids": missing_ids,
-        "unexpected_question_ids": unexpected_ids,
-        "completeness_percentage": ((len(all_expected_ids) - len(missing_ids)) / len(all_expected_ids)) * 100
-    }
-
-@app.get("/health", response_model=HealthCheck)
+@app.get("/health")
 async def health_check():
-    """Enhanced health check for deployment monitoring"""
-    api_configured = bool(os.getenv("ANTHROPIC_API_KEY"))
-    environment = os.getenv("ENVIRONMENT", "development")
-    
-    return HealthCheck(
-        status="healthy", 
-        timestamp=datetime.now().isoformat(),
-        api_configured=api_configured,
-        environment=environment
-    )
-
-# Additional endpoints for deployment monitoring
-@app.get("/api/status")
-async def api_status():
-    """API status endpoint for monitoring"""
+    """Health check endpoint"""
     return {
-        "api_status": "operational",
+        "status": "healthy",
+        "message": "Marketing Plan Generator API is running",
+        "timestamp": datetime.utcnow().isoformat(),
+        "anthropic_available": anthropic_client is not None
+    }
+
+@app.post("/api/generate-plan", response_model=Dict[str, Any])
+async def generate_plan(
+    request: GeneratePlanRequest,
+    client: anthropic.Anthropic = Depends(get_anthropic_client)
+):
+    """Generate a complete marketing plan using Claude AI"""
+    
+    try:
+        logger.info(f"Generating plan for {len(request.responses)} responses")
+        
+        # Extract business context
+        business_context = extract_business_context(request.responses)
+        
+        # Generate content for all 9 squares
+        squares = {}
+        for square_id in range(1, 10):
+            logger.info(f"Generating content for square {square_id}")
+            square_content = await generate_square_content(request.responses, square_id, client)
+            squares[square_id] = square_content
+        
+        # Create the marketing plan
+        plan_id = str(uuid.uuid4())
+        plan = MarketingPlan(
+            businessContext=business_context,
+            squares=squares,
+            generatedAt=datetime.utcnow().isoformat(),
+            planId=plan_id
+        )
+        
+        # Store the plan
+        plans_storage[plan_id] = plan
+        
+        logger.info(f"Successfully generated plan {plan_id}")
+        
+        return {
+            "plan": plan.dict(),
+            "planId": plan_id,
+            "message": "Marketing plan generated successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating plan: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate marketing plan: {str(e)}")
+
+@app.get("/api/plans", response_model=List[PlanSummary])
+async def get_plans():
+    """Get all saved marketing plans"""
+    try:
+        summaries = []
+        for plan_id, plan in plans_storage.items():
+            summary = PlanSummary(
+                planId=plan_id,
+                planName=f"Marketing Plan - {plan.businessContext.industry}",
+                createdAt=plan.generatedAt,
+                businessContext=plan.businessContext
+            )
+            summaries.append(summary)
+        
+        return summaries
+    except Exception as e:
+        logger.error(f"Error fetching plans: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch plans")
+
+@app.get("/api/plans/{plan_id}", response_model=MarketingPlan)
+async def get_plan(plan_id: str):
+    """Get a specific marketing plan"""
+    if plan_id not in plans_storage:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    
+    return plans_storage[plan_id]
+
+@app.post("/api/plans", response_model=Dict[str, str])
+async def save_plan(request: SavePlanRequest):
+    """Save a marketing plan"""
+    try:
+        plan_id = request.plan.planId or str(uuid.uuid4())
+        plans_storage[plan_id] = request.plan
+        
+        return {
+            "planId": plan_id,
+            "message": "Plan saved successfully"
+        }
+    except Exception as e:
+        logger.error(f"Error saving plan: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save plan")
+
+@app.delete("/api/plans/{plan_id}", response_model=Dict[str, str])
+async def delete_plan(plan_id: str):
+    """Delete a marketing plan"""
+    if plan_id not in plans_storage:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    
+    del plans_storage[plan_id]
+    return {"message": "Plan deleted successfully"}
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Marketing Plan Generator API",
         "version": "1.0.0",
-        "timestamp": datetime.now().isoformat(),
-        "endpoints": [
-            "/api/save-response",
-            "/api/save-user-data", 
-            "/api/user-data/{user_id}",
-            "/api/generate-plan",
-            "/api/plan/{user_id}"
-        ]
+        "docs": "/docs",
+        "health": "/health"
     }
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
