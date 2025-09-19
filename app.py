@@ -48,7 +48,7 @@ app.add_middleware(
         "http://localhost:5173",  # Vite dev server
         "http://localhost:3000",  # Alternative dev port
         "http://localhost:4173",  # Vite preview
-        "https://*.netlify.app",  # Netlify deployments
+        "https://ai-marketing-generator.netlify.app",  # Netlify deployments
         "https://*.vercel.app",   # Vercel deployments
         "https://*.surge.sh",     # Surge deployments
         "*"  # Allow all origins (be more restrictive in production)
